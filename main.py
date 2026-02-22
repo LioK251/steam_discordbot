@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import time
 from typing import Optional
 
 import aiohttp
@@ -44,6 +45,59 @@ FALLBACK_API_JSON_PATH = _env(
     default="api.json",
 )
 FALLBACK_PROVIDERS = load_providers_from_api_json(FALLBACK_API_JSON_PATH)
+
+# Last-resort data source: ManifestHub depotkeys.json (large mapping).
+DEPOTKEYS_FALLBACK_URL = (
+    "https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/refs/heads/main/depotkeys.json"
+)
+
+# Simple in-memory cache so we don't re-download on every miss.
+_DEPOTKEYS_CACHE: dict[str, object] = {"fetched_at": 0.0, "data": None}
+
+
+async def _get_depotkeys_map(session: aiohttp.ClientSession) -> Optional[dict[str, str]]:
+    """
+    Fetch and cache ManifestHub depotkeys.json.
+    Returns a mapping of string->string (IDs -> 64-hex key).
+    """
+    now = time.time()
+    cached_at = float(_DEPOTKEYS_CACHE.get("fetched_at") or 0.0)
+    cached = _DEPOTKEYS_CACHE.get("data")
+    if isinstance(cached, dict) and (now - cached_at) < 6 * 60 * 60:
+        # Cache for 6h; it's a big file and changes relatively slowly.
+        return cached  # type: ignore[return-value]
+
+    timeout = aiohttp.ClientTimeout(total=60.0)
+    try:
+        async with session.get(
+            DEPOTKEYS_FALLBACK_URL,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://github.com/"},
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    # Sanitize to dict[str, str] only.
+    cleaned: dict[str, str] = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str):
+            cleaned[k] = v
+
+    _DEPOTKEYS_CACHE["data"] = cleaned
+    _DEPOTKEYS_CACHE["fetched_at"] = now
+    return cleaned
+
+
+def _build_lua_for_appid(app_id: str, value: str) -> str:
+    # Format requested by user. Keep it tiny and compatible with common Lua loaders.
+    return f'addappid({int(app_id)})\naddappid({int(app_id)}, 1, "{value}")\n'
 
 
 async def start_webserver() -> web.AppRunner:
@@ -184,6 +238,36 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
         return headers
 
     async with aiohttp.ClientSession() as session:
+        async def try_send_depotkeys_lua(*, reason: str) -> bool:
+            depot_map = await _get_depotkeys_map(session)
+            if not isinstance(depot_map, dict):
+                return False
+
+            val = depot_map.get(str(app_id))
+            if not isinstance(val, str) or not val.strip():
+                return False
+
+            tmp_dir = tempfile.gettempdir()
+            out_lua_path = os.path.join(tmp_dir, f"depotkeys_{app_id}.lua")
+            try:
+                with open(out_lua_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(_build_lua_for_appid(app_id, val.strip()))
+
+                await ctx.reply(
+                    content=(
+                        f"No manifest zip available for `{display_name or app_id}` (`{app_id}`). "
+                        f"Sending Lua fallback from `depotkeys.json` ({reason})."
+                    ),
+                    file=discord.File(out_lua_path, filename=f"{app_id}.lua"),
+                )
+                return True
+            finally:
+                try:
+                    if os.path.exists(out_lua_path):
+                        os.remove(out_lua_path)
+                except Exception:
+                    pass
+
         status = None
         try:
             status = await manifest_api.get_status(session, MANIFEST_API_KEY, app_id)
@@ -208,6 +292,8 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
         # If Morrenus status says unavailable, it might still exist on a fallback provider.
         # Only hard-stop when we have no fallback providers configured.
         if manifest_exists is False and not FALLBACK_PROVIDERS:
+            if await try_send_depotkeys_lua(reason="Morrenus status unavailable"):
+                return
             await ctx.reply(f"No manifest file available for `{resolved_name}` (`{app_id}`).")
             return
 
@@ -308,12 +394,16 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
 
                 if not ok:
                     if attempted == 0:
-                        await downloading_msg.edit(
-                            content="Download failed: no fallback providers configured."
-                        )
+                        if await try_send_depotkeys_lua(reason="no fallback providers"):
+                            await downloading_msg.delete()
+                            return
+                        await downloading_msg.edit(content="Download failed: no fallback providers configured.")
                         return
 
                     if unavailable == attempted:
+                        if await try_send_depotkeys_lua(reason="fallback providers unavailable"):
+                            await downloading_msg.delete()
+                            return
                         await downloading_msg.edit(
                             content="Download failed: manifest not available on fallback providers."
                         )
@@ -322,9 +412,10 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
                     details = "; ".join(attempts[:6])
                     if len(attempts) > 6:
                         details += " ..."
-                    await downloading_msg.edit(
-                        content=f"Download failed from all providers. Details: {details}"
-                    )
+                    if await try_send_depotkeys_lua(reason="all providers failed"):
+                        await downloading_msg.delete()
+                        return
+                    await downloading_msg.edit(content=f"Download failed from all providers. Details: {details}")
                     return
 
             await ctx.reply(
