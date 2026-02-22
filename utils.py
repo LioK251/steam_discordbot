@@ -7,6 +7,38 @@ def is_digits(s: str) -> bool:
     return bool(re.fullmatch(r"\d+", s.strip()))
 
 
+_STEAM_APP_ID_RE = re.compile(
+    r"""
+    (?:
+        https?://
+    )?
+    (?:
+        www\.
+    )?
+    (?:
+        store\.steampowered\.com
+        |
+        steamcommunity\.com
+    )
+    /app/
+    (?P<appid>\d+)
+    (?:/|$)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def extract_steam_app_id(text: str) -> str | None:
+    """
+    Extracts AppID from common Steam URLs like:
+      https://store.steampowered.com/app/2129530/REANIMAL/
+    """
+    m = _STEAM_APP_ID_RE.search((text or "").strip())
+    if not m:
+        return None
+    return m.group("appid")
+
+
 def fmt_bytes(n: int) -> str:
     # Human readable, base-2-ish but user-friendly.
     if n < 0:

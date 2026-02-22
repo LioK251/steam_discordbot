@@ -11,7 +11,7 @@ from aiohttp import web
 from discord.ext import commands
 
 import manifest_api
-from utils import fmt_bytes, is_digits, safe_filename
+from utils import extract_steam_app_id, fmt_bytes, is_digits, safe_filename
 
 
 def _env(name: str, *, default: Optional[str] = None, required: bool = False) -> str:
@@ -208,6 +208,12 @@ async def app_cmd(ctx: commands.Context, *, query: str) -> None:
     if not q:
         await ctx.reply(f"Usage: `{COMMAND_PREFIX}app 400` or `{COMMAND_PREFIX}app Portal`")
         return
+
+    # URL path (Steam store/community): treat as AppID request.
+    # Example: .app https://store.steampowered.com/app/2129530/REANIMAL/
+    appid_from_url = extract_steam_app_id(q)
+    if appid_from_url is not None:
+        q = appid_from_url
 
     # App ID path
     if is_digits(q):
