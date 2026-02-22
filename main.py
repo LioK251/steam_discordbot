@@ -158,6 +158,31 @@ async def _prompt_confirm(ctx: commands.Context, text: str, *, timeout_s: float 
 
 
 async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, display_name: Optional[str] = None) -> None:
+    def fallback_headers_for(url: str) -> dict[str, str]:
+        # Some third-party providers return 403 unless the request looks browser-ish.
+        headers: dict[str, str] = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+        u = (url or "").lower()
+        if "twentytwocloud.com" in u:
+            headers["Referer"] = "https://twentytwocloud.com/"
+            headers["Origin"] = "https://twentytwocloud.com"
+        elif "raw.githubusercontent.com" in u or "githubusercontent.com" in u:
+            headers["Referer"] = "https://github.com/"
+        else:
+            # Generic Steam-ish referer for plain appid endpoints.
+            headers["Referer"] = f"https://store.steampowered.com/app/{app_id}/"
+        return headers
+
     async with aiohttp.ClientSession() as session:
         status = None
         try:
@@ -243,7 +268,7 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
                             url,
                             timeout=timeout,
                             allow_redirects=True,
-                            headers={"User-Agent": "lsteam-manifestbot/1.0"},
+                            headers=fallback_headers_for(url),
                         ) as resp:
                             if resp.status == p.unavailable_code:
                                 unavailable += 1
