@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: lsteam-manifestbot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: MANIFEST_API_KEY
+        sync: false
+      - key: COMMAND_PREFIX
+        value: "."
+      - key: MAX_UPLOAD_MB
+        value: "25"
+
