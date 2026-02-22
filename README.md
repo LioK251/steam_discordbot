@@ -21,6 +21,7 @@ Set these in Render (or your local shell):
 - `MANIFEST_API_KEY` (required)
 - `COMMAND_PREFIX` (default `.`)
 - `MAX_UPLOAD_MB` (default `25`)
+- `BLOCKED_USER_IDS` (optional, comma-separated user IDs)
 
 Important: don’t hardcode your API key in code. If you already pasted it in chat anywhere public, rotate it.
 
@@ -52,4 +53,5 @@ This repo includes a `render.yaml` blueprint. You can also create the service ma
 ## Notes / limitations
 
 - Discord has an upload size limit. If the manifest ZIP is bigger than `MAX_UPLOAD_MB`, the bot will refuse to download/upload it.
+- If Morrenus download fails, the bot falls back to other providers listed in `api.json` (you can edit/disable providers there).
 

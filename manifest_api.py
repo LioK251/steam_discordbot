@@ -40,20 +40,41 @@ async def _get_json(
     *,
     params: dict[str, Any],
     timeout_s: float = 30.0,
+    retries: int = 2,
 ) -> dict[str, Any]:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
-    async with session.get(url, params=params, timeout=timeout) as resp:
-        if resp.status != 200:
-            body = await _read_error_text(resp)
-            raise ManifestApiError(f"HTTP {resp.status} from API: {body}")
+
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
         try:
-            data = await resp.json()
-        except Exception as e:
-            body = await _read_error_text(resp)
-            raise ManifestApiError(f"Failed to parse JSON: {e}; body={body}") from e
-        if not isinstance(data, dict):
-            raise ManifestApiError("Unexpected JSON shape (expected object).")
-        return data
+            async with session.get(url, params=params, timeout=timeout) as resp:
+                if resp.status == 200:
+                    try:
+                        data = await resp.json()
+                    except Exception as e:
+                        body = await _read_error_text(resp)
+                        raise ManifestApiError(f"Failed to parse JSON: {e}; body={body}") from e
+                    if not isinstance(data, dict):
+                        raise ManifestApiError("Unexpected JSON shape (expected object).")
+                    return data
+
+                body = await _read_error_text(resp)
+
+                # Retry transient errors only.
+                if resp.status >= 500 and attempt < retries:
+                    await asyncio.sleep(0.6 * (2**attempt))
+                    continue
+
+                raise ManifestApiError(f"HTTP {resp.status} from API: {body}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_err = e
+            if attempt < retries:
+                await asyncio.sleep(0.6 * (2**attempt))
+                continue
+            raise ManifestApiError(f"API request failed: {e}") from e
+
+    # Should be unreachable, but keep mypy happy.
+    raise ManifestApiError(f"API request failed: {last_err}")
 
 
 async def get_user_stats(session: aiohttp.ClientSession, api_key: str) -> dict[str, Any]:
@@ -106,6 +127,7 @@ async def download_manifest_to_path(
     *,
     max_bytes: Optional[int] = None,
     timeout_s: float = 300.0,
+    retries: int = 2,
 ) -> int:
     """
     Downloads /manifest/<app_id> to out_path.
@@ -114,25 +136,40 @@ async def download_manifest_to_path(
     url = f"{BASE_URL}/manifest/{app_id}"
     timeout = aiohttp.ClientTimeout(total=timeout_s)
 
-    bytes_written = 0
-    async with session.get(url, params={"api_key": api_key}, timeout=timeout) as resp:
-        if resp.status != 200:
-            body = await _read_error_text(resp)
-            raise ManifestApiError(f"HTTP {resp.status} while downloading: {body}")
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        bytes_written = 0
+        try:
+            async with session.get(url, params={"api_key": api_key}, timeout=timeout) as resp:
+                if resp.status != 200:
+                    body = await _read_error_text(resp)
+                    # Retry only server errors for downloads.
+                    if resp.status >= 500 and attempt < retries:
+                        await asyncio.sleep(0.8 * (2**attempt))
+                        continue
+                    raise ManifestApiError(f"HTTP {resp.status} while downloading: {body}")
 
-        # Stream to disk to avoid keeping the whole file in memory.
-        with open(out_path, "wb") as f:
-            async for chunk in resp.content.iter_chunked(1024 * 64):
-                if not chunk:
-                    continue
-                bytes_written += len(chunk)
-                if max_bytes is not None and bytes_written > max_bytes:
-                    raise ManifestApiError(
-                        f"Manifest is too large to upload (>{max_bytes} bytes)."
-                    )
-                f.write(chunk)
+                # Stream to disk to avoid keeping the whole file in memory.
+                with open(out_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 64):
+                        if not chunk:
+                            continue
+                        bytes_written += len(chunk)
+                        if max_bytes is not None and bytes_written > max_bytes:
+                            raise ManifestApiError(
+                                f"Manifest is too large to upload (>{max_bytes} bytes)."
+                            )
+                        f.write(chunk)
 
-    # Let the event loop breathe a little after a potentially big stream.
-    await asyncio.sleep(0)
-    return bytes_written
+            # Let the event loop breathe a little after a potentially big stream.
+            await asyncio.sleep(0)
+            return bytes_written
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_err = e
+            if attempt < retries:
+                await asyncio.sleep(0.8 * (2**attempt))
+                continue
+            raise ManifestApiError(f"Download failed: {e}") from e
+
+    raise ManifestApiError(f"Download failed: {last_err}")
 

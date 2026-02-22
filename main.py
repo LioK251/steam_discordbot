@@ -11,6 +11,7 @@ from aiohttp import web
 from discord.ext import commands
 
 import manifest_api
+from fallback_providers import load_providers_from_api_json
 from utils import extract_steam_app_id, fmt_bytes, is_digits, safe_filename
 
 
@@ -29,6 +30,20 @@ DISCORD_TOKEN = _env("DISCORD_TOKEN", required=True)
 # Default to 25MB but allow overriding in Render env vars.
 MAX_UPLOAD_MB = int(_env("MAX_UPLOAD_MB", default="25"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Optional denylist (comma-separated user IDs). Neutral response only.
+BLOCKED_USER_IDS = {
+    s.strip()
+    for s in _env("BLOCKED_USER_IDS", default="").split(",")
+    if s.strip()
+}
+
+# Load ltsteamplugin-style fallback manifest providers (if present).
+FALLBACK_API_JSON_PATH = _env(
+    "FALLBACK_API_JSON_PATH",
+    default="api.json",
+)
+FALLBACK_PROVIDERS = load_providers_from_api_json(FALLBACK_API_JSON_PATH)
 
 
 async def start_webserver() -> web.AppRunner:
@@ -81,6 +96,12 @@ async def on_command_error(ctx: commands.Context, error: Exception) -> None:
         return
     if isinstance(error, commands.BadArgument):
         await ctx.reply("Bad argument. Try an AppID or game name.")
+        return
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.reply(f"Slow down. Try again in `{error.retry_after:.1f}s`.")
+        return
+    if isinstance(error, commands.MaxConcurrencyReached):
+        await ctx.reply("You already have a request running. Wait for it to finish.")
         return
     # Fallback
     await ctx.reply(f"Error: {error}")
@@ -138,17 +159,29 @@ async def _prompt_confirm(ctx: commands.Context, text: str, *, timeout_s: float 
 
 async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, display_name: Optional[str] = None) -> None:
     async with aiohttp.ClientSession() as session:
-        status = await manifest_api.get_status(session, MANIFEST_API_KEY, app_id)
+        status = None
+        try:
+            status = await manifest_api.get_status(session, MANIFEST_API_KEY, app_id)
+        except Exception:
+            # Status API is helpful for file info, but not required for download.
+            status = None
 
-        manifest_exists = bool(status.get("manifest_file_exists"))
-        game_name = status.get("game_name") if isinstance(status.get("game_name"), str) else None
-        file_size = status.get("file_size") if isinstance(status.get("file_size"), int) else None
-        file_age_days = status.get("file_age_days") if isinstance(status.get("file_age_days"), (int, float)) else None
-        needs_update = status.get("needs_update") if isinstance(status.get("needs_update"), bool) else None
+        manifest_exists = None
+        game_name = None
+        file_size = None
+        file_age_days = None
+        needs_update = None
+        if isinstance(status, dict):
+            manifest_exists = bool(status.get("manifest_file_exists"))
+            game_name = status.get("game_name") if isinstance(status.get("game_name"), str) else None
+            file_size = status.get("file_size") if isinstance(status.get("file_size"), int) else None
+            file_age_days = status.get("file_age_days") if isinstance(status.get("file_age_days"), (int, float)) else None
+            needs_update = status.get("needs_update") if isinstance(status.get("needs_update"), bool) else None
 
         resolved_name = display_name or game_name or f"App {app_id}"
 
-        if not manifest_exists:
+        # If status API says it's not available, respect it.
+        if manifest_exists is False:
             await ctx.reply(f"No manifest file available for `{resolved_name}` (`{app_id}`).")
             return
 
@@ -177,15 +210,65 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
         out_path = os.path.join(tmp_dir, f"{base}_{app_id}.zip")
 
         try:
-            bytes_written = await manifest_api.download_manifest_to_path(
-                session,
-                MANIFEST_API_KEY,
-                app_id,
-                out_path,
-                max_bytes=MAX_UPLOAD_BYTES,
-            )
+            provider_used = "Morrenus"
+            try:
+                bytes_written = await manifest_api.download_manifest_to_path(
+                    session,
+                    MANIFEST_API_KEY,
+                    app_id,
+                    out_path,
+                    max_bytes=MAX_UPLOAD_BYTES,
+                )
+            except Exception:
+                # Fallback providers from ltsteamplugin api.json (if any).
+                bytes_written = 0
+                ok = False
+                for p in FALLBACK_PROVIDERS:
+                    # Avoid retrying the same provider we already attempted.
+                    if p.name.strip().lower() == "morrenus":
+                        continue
+
+                    url = p.build_url(app_id=app_id, moapikey=MANIFEST_API_KEY)
+                    if "<moapikey>" in p.url_template and not MANIFEST_API_KEY:
+                        continue
+
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=300.0)
+                        async with session.get(url, timeout=timeout) as resp:
+                            if resp.status == p.unavailable_code:
+                                continue
+                            if resp.status != p.success_code:
+                                continue
+
+                            provider_used = p.name
+                            bytes_written = 0
+                            with open(out_path, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(1024 * 64):
+                                    if not chunk:
+                                        continue
+                                    bytes_written += len(chunk)
+                                    if bytes_written > MAX_UPLOAD_BYTES:
+                                        raise manifest_api.ManifestApiError(
+                                            f"Manifest is too large to upload (>{MAX_UPLOAD_BYTES} bytes)."
+                                        )
+                                    f.write(chunk)
+                            ok = True
+                            break
+                    except manifest_api.ManifestApiError as e:
+                        # Size limit / explicit API error: surface to user.
+                        await downloading_msg.edit(content=f"Download failed: {e}")
+                        return
+                    except Exception:
+                        continue
+
+                if not ok:
+                    await downloading_msg.edit(
+                        content="Download failed from all providers. Try again later."
+                    )
+                    return
+
             await ctx.reply(
-                content=f"`{resolved_name}` (`{app_id}`) manifest: `{fmt_bytes(bytes_written)}`",
+                content=f"`{resolved_name}` (`{app_id}`) manifest: `{fmt_bytes(bytes_written)}` (source: `{provider_used}`)",
                 file=discord.File(out_path, filename=f"{base}_{app_id}.zip"),
             )
             await downloading_msg.delete()
@@ -199,6 +282,8 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
 
 
 @bot.command(name="app")
+@commands.cooldown(2, 20, commands.BucketType.user)
+@commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def app_cmd(ctx: commands.Context, *, query: str) -> None:
     """
     .app <appid>
@@ -207,6 +292,10 @@ async def app_cmd(ctx: commands.Context, *, query: str) -> None:
     q = (query or "").strip()
     if not q:
         await ctx.reply(f"Usage: `{COMMAND_PREFIX}app 400` or `{COMMAND_PREFIX}app Portal`")
+        return
+
+    if str(ctx.author.id) in BLOCKED_USER_IDS:
+        await ctx.reply("Poshel Nahuy Alik Huyalik pidar vanuchi.")
         return
 
     # URL path (Steam store/community): treat as AppID request.
@@ -222,7 +311,14 @@ async def app_cmd(ctx: commands.Context, *, query: str) -> None:
 
     # Name path: search + require confirmation
     async with aiohttp.ClientSession() as session:
-        results = await manifest_api.search_games(session, MANIFEST_API_KEY, q, limit=8)
+        try:
+            results = await manifest_api.search_games(session, MANIFEST_API_KEY, q, limit=8)
+        except manifest_api.ManifestApiError:
+            await ctx.reply("Manifest API is not responding right now. Try again in a bit.")
+            return
+        except Exception:
+            await ctx.reply("Request failed (network error). Try again in a bit.")
+            return
 
     if not results:
         await ctx.reply(f"No matches for `{q}`.")
@@ -254,12 +350,24 @@ async def app_cmd(ctx: commands.Context, *, query: str) -> None:
 
 
 @bot.command(name="stats")
+@commands.cooldown(2, 10, commands.BucketType.user)
 async def stats_cmd(ctx: commands.Context) -> None:
     """
     .stats
     """
+    if str(ctx.author.id) in BLOCKED_USER_IDS:
+        await ctx.reply("Poshel Nahuy Alik Huyalik pidar vanuchi.")
+        return
+
     async with aiohttp.ClientSession() as session:
-        data = await manifest_api.get_user_stats(session, MANIFEST_API_KEY)
+        try:
+            data = await manifest_api.get_user_stats(session, MANIFEST_API_KEY)
+        except manifest_api.ManifestApiError:
+            await ctx.reply("Manifest API is not responding right now. Try again in a bit.")
+            return
+        except Exception:
+            await ctx.reply("Request failed (network error). Try again in a bit.")
+            return
 
     # Pretty-print without leaking anything sensitive.
     user_id = data.get("user_id")
