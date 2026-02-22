@@ -180,8 +180,9 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
 
         resolved_name = display_name or game_name or f"App {app_id}"
 
-        # If status API says it's not available, respect it.
-        if manifest_exists is False:
+        # If Morrenus status says unavailable, it might still exist on a fallback provider.
+        # Only hard-stop when we have no fallback providers configured.
+        if manifest_exists is False and not FALLBACK_PROVIDERS:
             await ctx.reply(f"No manifest file available for `{resolved_name}` (`{app_id}`).")
             return
 
@@ -223,6 +224,9 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
                 # Fallback providers from ltsteamplugin api.json (if any).
                 bytes_written = 0
                 ok = False
+                attempts: list[str] = []
+                attempted = 0
+                unavailable = 0
                 for p in FALLBACK_PROVIDERS:
                     # Avoid retrying the same provider we already attempted.
                     if p.name.strip().lower() == "morrenus":
@@ -233,11 +237,20 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
                         continue
 
                     try:
+                        attempted += 1
                         timeout = aiohttp.ClientTimeout(total=300.0)
-                        async with session.get(url, timeout=timeout) as resp:
+                        async with session.get(
+                            url,
+                            timeout=timeout,
+                            allow_redirects=True,
+                            headers={"User-Agent": "lsteam-manifestbot/1.0"},
+                        ) as resp:
                             if resp.status == p.unavailable_code:
+                                unavailable += 1
+                                attempts.append(f"{p.name}: unavailable ({resp.status})")
                                 continue
                             if resp.status != p.success_code:
+                                attempts.append(f"{p.name}: HTTP {resp.status}")
                                 continue
 
                             provider_used = p.name
@@ -258,12 +271,34 @@ async def _fetch_and_send_manifest(ctx: commands.Context, app_id: str, *, displa
                         # Size limit / explicit API error: surface to user.
                         await downloading_msg.edit(content=f"Download failed: {e}")
                         return
+                    except asyncio.TimeoutError:
+                        attempts.append(f"{p.name}: timeout")
+                        continue
+                    except aiohttp.ClientError:
+                        attempts.append(f"{p.name}: network error")
+                        continue
                     except Exception:
+                        attempts.append(f"{p.name}: error")
                         continue
 
                 if not ok:
+                    if attempted == 0:
+                        await downloading_msg.edit(
+                            content="Download failed: no fallback providers configured."
+                        )
+                        return
+
+                    if unavailable == attempted:
+                        await downloading_msg.edit(
+                            content="Download failed: manifest not available on fallback providers."
+                        )
+                        return
+
+                    details = "; ".join(attempts[:6])
+                    if len(attempts) > 6:
+                        details += " ..."
                     await downloading_msg.edit(
-                        content="Download failed from all providers. Try again later."
+                        content=f"Download failed from all providers. Details: {details}"
                     )
                     return
 
@@ -314,10 +349,16 @@ async def app_cmd(ctx: commands.Context, *, query: str) -> None:
         try:
             results = await manifest_api.search_games(session, MANIFEST_API_KEY, q, limit=8)
         except manifest_api.ManifestApiError:
-            await ctx.reply("Manifest API is not responding right now. Try again in a bit.")
+            await ctx.reply(
+                "Search is not available right now. Use an AppID or Steam URL instead.\n"
+                f"Example: `{COMMAND_PREFIX}app 400` or `{COMMAND_PREFIX}app https://store.steampowered.com/app/400/`"
+            )
             return
         except Exception:
-            await ctx.reply("Request failed (network error). Try again in a bit.")
+            await ctx.reply(
+                "Search request failed (network error). Use an AppID or Steam URL instead.\n"
+                f"Example: `{COMMAND_PREFIX}app 400`"
+            )
             return
 
     if not results:
